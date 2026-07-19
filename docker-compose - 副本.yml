@@ -1,0 +1,148 @@
+#!/bin/bash
+set -e
+echo "开始加载并启动离线PaddleOCR服务..."
+
+# 前置检查
+if ! docker info > /dev/null 2>&1; then
+    echo "Docker未运行，请先启动Docker服务后重试"
+    exit 1
+fi
+if ! docker run --rm --gpus all nvidia/cuda:12.6.0-base-ubuntu22.04 nvidia-smi > /dev/null 2>&1; then
+    echo "警告：未检测到Docker GPU支持，服务可能无法正常运行"
+    read -r -p "是否继续？(y/N) " reply
+    if [[ ! "$reply" =~^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+
+# 加载离线镜像
+echo "加载离线Docker镜像..."
+docker load -i paddleocr-genai-vllm-server.tar
+docker load -i paddleocr-vl.tar
+docker load -i pandocr-ocr-api.tar
+docker load -i pandocr-web.tar
+
+# 创建原配置要求的持久化目录
+echo "创建模型缓存与持久化目录..."
+mkdir -p ./model_cache ./model_cache_ocr ./model_cache_ppocrv6 ./model_cache_ppocrv6_ocr ./data
+mkdir -p ./static ./logs
+
+# 创建自定义桥接网络（对齐原compose的服务发现规则）
+docker network inspect paddleocr-network > /dev/null 2>&1 || docker network create paddleocr-network
+
+# 启动paddleocr-vlm-server 完全对齐原配置规则
+echo "启动VLM推理服务..."
+docker run -d \
+  --name paddleocr-vlm-server \
+  --gpus '"device=0"' \
+  --network paddleocr-network \
+  -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
+  -e PADDLEOCR_VL_MODEL_NAME=PaddleOCR-VL-1.6-0.9B \
+  -v $(pwd)/model_cache:/home/paddleocr/.paddlex \
+  -v $(pwd)/model_cache_ocr:/home/paddleocr/.paddleocr \
+  -v $(pwd)/start-vlm.sh:/home/paddleocr/start-vlm.sh:ro \
+  --user root \
+  --restart unless-stopped \
+  --health-cmd "curl -f http://localhost:8080/health || exit 1" \
+  --health-interval 30s \
+  --health-timeout 10s \
+  --health-retries 5 \
+  --health-start-period 900s \
+  ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server:latest-nvidia-gpu-offline \
+  /bin/bash /home/paddleocr/start-vlm.sh
+
+# 等待VLM服务健康就绪，再启动下游服务
+echo "等待VLM服务启动就绪..."
+while ! docker inspect --format '{{.State.Health.Status}}' paddleocr-vlm-server | grep -q "healthy"; do
+  sleep 5
+done
+
+# 启动paddleocr-vl-api 完全对齐原端口规则 映射宿主机8081
+echo "启动VL API服务..."
+docker run -d \
+  --name paddleocr-vl-api \
+  --gpus '"device=0"' \
+  --network paddleocr-network \
+  -p 127.0.0.1:8081:8080 \
+  -e VLM_BACKEND=vllm \
+  -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
+  -v $(pwd)/model_cache:/home/paddleocr/.paddlex \
+  -v $(pwd)/model_cache_ocr:/home/paddleocr/.paddleocr \
+  -v $(pwd)/pipeline_config_vllm.yaml:/home/paddleocr/pipeline_config_vllm.yaml \
+  --user root \
+  --restart unless-stopped \
+  --health-cmd "curl -f http://localhost:8080/health || exit 1" \
+  --health-interval 30s \
+  --health-timeout 10s \
+  --health-retries 5 \
+  --health-start-period 300s \
+  ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:latest-nvidia-gpu-offline \
+  /bin/bash -c "paddlex --serve --pipeline /home/paddleocr/pipeline_config_vllm.yaml"
+
+# 等待VL API服务健康就绪
+echo "等待VL API服务启动就绪..."
+while ! docker inspect --format '{{.State.Health.Status}}' paddleocr-vl-api | grep -q "healthy"; do
+  sleep 5
+done
+
+# 启动pandocr-ocr-api 完全对齐原端口规则 映射宿主机8082
+echo "启动OCR API服务..."
+docker run -d \
+  --name pandocr-ocr-api \
+  --gpus '"device=0"' \
+  --network paddleocr-network \
+  -p 127.0.0.1:8082:8080 \
+  -e PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True \
+  -v $(pwd)/model_cache_ppocrv6:/home/paddleocr/.paddlex \
+  -v $(pwd)/model_cache_ppocrv6_ocr:/home/paddleocr/.paddleocr \
+  -v $(pwd)/pipeline_config_ocr_v6.yaml:/home/paddleocr/pipeline_config_ocr_v6.yaml:ro \
+  --user root \
+  --restart unless-stopped \
+  --health-cmd "curl -f http://localhost:8080/health || exit 1" \
+  --health-interval 30s \
+  --health-timeout 10s \
+  --health-retries 5 \
+  --health-start-period 300s \
+  pandocr-ocr-api:latest \
+  /bin/bash -c "paddlex --serve --pipeline /home/paddleocr/pipeline_config_ocr_v6.yaml --host 0.0.0.0 --port 8080"
+
+# 等待OCR API服务健康就绪
+echo "等待OCR API服务启动就绪..."
+while ! docker inspect --format '{{.State.Health.Status}}' pandocr-ocr-api | grep -q "healthy"; do
+  sleep 5
+done
+
+# 启动pandocr-web 完全对齐原配置规则 映射宿主机8000
+echo "启动WebUI服务..."
+docker run -d \
+  --name pandocr-web \
+  --network paddleocr-network \
+  -p 127.0.0.1:8000:8000 \
+  -e PADDLE_SERVICE_URL=http://paddleocr-vl-api:8080/layout-parsing \
+  -e PADDLE_OCR_SERVICE_URL=http://pandocr-ocr-api:8080/ocr \
+  -e VLM_BACKEND=vllm \
+  -e PANDOCR_GPU_DEVICE_ID=0 \
+  -e PANDOCR_ENABLE_UNLIMITED_OCR=0 \
+  -e PANDOCR_ACTIVE_MODEL_ON_START=paddleocr-vl-1.6 \
+  -e PANDOCR_CORS_ORIGINS=http://localhost:8000,http://127.0.0.1:8000 \
+  -e PANDOCR_MAX_UPLOAD_MB=512 \
+  -v $(pwd)/static:/app/static \
+  -v $(pwd)/data:/app/data \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  --restart unless-stopped \
+  --security-opt no-new-privileges:true \
+  --health-cmd "curl -f http://localhost:8000/ || exit 1" \
+  --health-interval 30s \
+  --health-timeout 10s \
+  --health-retries 3 \
+  --health-start-period 10s \
+  pandocr-web:latest
+
+echo ""
+echo "所有服务已启动完成！"
+echo "WebUI: http://localhost:8000"
+echo "VL API: http://localhost:8081"
+echo "OCR API: http://localhost:8082"
+echo ""
+echo "查看指定容器日志：docker logs -f [容器名]"
+echo "停止所有服务：docker stop paddleocr-vlm-server paddleocr-vl-api pandocr-ocr-api pandocr-web"
