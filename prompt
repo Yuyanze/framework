@@ -18,3 +18,38 @@ RUN pip install --no-cache-dir python-pptx pandas matplotlib numpy
 # 预装nodejs + pptgenjs全局包
 RUN apt-get update && apt-get install -y nodejs npm && \
     npm install -g pptgenjs
+
+docker build -t yuxi-sandbox-prebuilt:v0.8 .
+
+docker save yuxi-sandbox-prebuilt:v0.8 -o yuxi_sandbox_prebuilt.tar
+
+# test_ppt.py
+from pptx import Presentation
+import subprocess
+import json
+print("python-pptx 导入成功")
+# 测试pptgenjs
+res = subprocess.run(["pptgenjs", "--version"], capture_output=True, text=True)
+print("pptgenjs版本：", res.stdout)
+
+# 原生：自动提取依赖，拼接安装命令
+deps = self.extract_dependencies(code)
+install_cmds = self.gen_install_script(deps)
+run_code = install_cmds + "\n" + code
+
+
+
+# ========== 【离线补丁 START】 ==========
+# 内网离线环境：禁止自动生成 pip / npm install 安装脚本
+# if self.cfg.get("SANDBOX_AUTO_INSTALL_DEPS", "true") == "true":
+#     deps = self.extract_dependencies(code)
+#     install_cmds = self.gen_install_script(deps)
+#     run_code = install_cmds + "\n" + code
+# else:
+#     run_code = code
+run_code = code
+# ========== 【离线补丁 END】 ==========
+
+
+
+
