@@ -7,3 +7,14 @@ Node：pptgenjs（全局可用，命令行直接调用 pptgenjs）
 4. 不要指定特殊版本号，直接默认导入；不要写版本锁定语法（例如 python-pptx==1.2.0），防止版本不匹配。
 5. 绘图使用matplotlib，数据处理使用pandas，所有依赖均已就绪。
 6. 如果需要生成PPT文件，输出文件路径为 /app/workspace/ 目录下，方便系统读取返回。
+
+
+# 和Yuxi原版沙盒基础镜像版本对齐
+FROM yuxi-sandbox:latest
+
+# 预装python数据分析+PPT依赖
+RUN pip install --no-cache-dir python-pptx pandas matplotlib numpy
+
+# 预装nodejs + pptgenjs全局包
+RUN apt-get update && apt-get install -y nodejs npm && \
+    npm install -g pptgenjs
